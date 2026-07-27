@@ -1,4 +1,5 @@
 const { aaveV3Export } = require("../helper/aave");
+const BigNumber = require("bignumber.js");
 
 // https://aave.com/docs/resources/addresses
 // Ethena backing supply wallets to exclude from TVL
@@ -59,7 +60,63 @@ const CONFIG = {
   monad: ['0xB65A68B98274ef7D9a60E0C0747dD1BEc3D32fad']
 };
 
-module.exports = aaveV3Export(CONFIG)
+const aaveExports = aaveV3Export(CONFIG)
+
+// Mantle-specific TVL calculation.
+// The default helper uses underlying.balanceOf(aTokenAddress), which equals the
+// available liquidity (total supplied - borrowed). On Mantle this call reverts for
+// USDT0, so we fall back to the protocol data provider's getReserveData() and use
+// totalAToken - totalStableDebt - totalVariableDebt for every asset.
+const MANTLE_POOL_DATA = '0x487c5c669D9eee6057C44973207101276cf73b68'
+
+aaveExports.mantle.tvl = async (api) => {
+  const reserves = await api.call({
+    target: MANTLE_POOL_DATA,
+    abi: 'function getAllReservesTokens() view returns ((string symbol, address tokenAddress)[])',
+  })
+  const underlyingTokens = reserves.map((r) => r.tokenAddress)
+
+  const reserveData = await api.multiCall({
+    calls: underlyingTokens,
+    target: MANTLE_POOL_DATA,
+    abi: 'function getReserveData(address asset) view returns (uint256 unbacked, uint256 accruedToTreasuryScaled, uint256 totalAToken, uint256 totalStableDebt, uint256 totalVariableDebt, uint256 liquidityRate, uint256 variableBorrowRate, uint256 stableBorrowRate, uint256 averageStableBorrowRate, uint256 liquidityIndex, uint256 variableBorrowIndex, uint40 lastUpdateTimestamp)',
+  })
+
+  reserveData.forEach((data, i) => {
+    const available = BigNumber(data.totalAToken)
+      .minus(data.totalStableDebt)
+      .minus(data.totalVariableDebt)
+    if (available.gt(0)) {
+      api.add(underlyingTokens[i], available.toFixed(0))
+    }
+  })
+
+  // Mirror the default Ethena blacklist lender subtraction for Mantle.
+  if (ETHENA_BLACKLIST.length > 0) {
+    const blCalls = []
+    for (const entry of ETHENA_BLACKLIST) {
+      underlyingTokens.forEach((token) => {
+        blCalls.push({ target: MANTLE_POOL_DATA, params: [token, entry.user] })
+      })
+    }
+
+    const userData = await api.multiCall({
+      calls: blCalls,
+      abi: 'function getUserReserveData(address asset, address user) view returns (uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, uint256 liquidityRate, uint40 stableRateLastUpdated, bool usageAsCollateralEnabled)',
+    })
+
+    userData.forEach((data, i) => {
+      const token = blCalls[i].params[0]
+      if (+data.currentATokenBalance > 0) {
+        api.add(token, -data.currentATokenBalance)
+      }
+    })
+  }
+
+  return api.getBalances()
+}
+
+module.exports = aaveExports
 
 module.exports.hallmarks = [
   ['2022-08-04', "Start OP Rewards"],
